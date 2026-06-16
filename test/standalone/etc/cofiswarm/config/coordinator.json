@@ -1,0 +1,44 @@
+{
+  "coordinator": {
+    "_memory_note": "Capped from null \u2014 36 GB M3 Max, llama np=1. null was killing server via OOM.",
+    "default_mode": "router",
+    "modes": {
+      "router": {
+        "classifier": "foreman",
+        "max_select": 2
+      },
+      "cascade": {
+        "synthesizer": "synthesis",
+        "synthesis_policy": "summary"
+      }
+    },
+    "port": 8000,
+    "profiles": {
+      "balanced": {
+        "max_context": 2048
+      },
+      "max": {
+        "max_context": 4096
+      },
+      "mixed": {
+        "max_context": 3072
+      },
+      "safe": {
+        "max_context": 1024
+      }
+    },
+    "rss": {
+      "enabled": true,
+      "max_items": 50
+    }
+  },
+  "rag": {
+    "embedder": "mlx",
+    "enabled": true,
+    "min_score": 1.0,
+    "top_k": 3
+  },
+  "ui": {
+    "port": 3000
+  }
+}
