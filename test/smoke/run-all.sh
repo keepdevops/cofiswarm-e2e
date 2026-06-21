@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run the full observer presence smoke suite: the Python ServiceComponent path plus every Go
-# presence-attaching binary (4 mode relays + 2 adapters), each end-to-end against live NATS
+# presence-attaching binary (4 mode relays + 2 adapters + convert), each end-to-end against live NATS
 # (announce -> online -> goodbye -> offline). Exits non-zero if any case fails.
 #
 # Each case boots its own nats-server + zmq-bridge + observer and tears them down, so they run
@@ -38,6 +38,7 @@ done
 for a in agentic openai-compat; do
   run "adapter-$a" bash "$HERE/adapter-smoke.sh" "$a"
 done
+run "convert" bash "$HERE/convert-smoke.sh"
 
 echo "-----------------------------------"
 fails=$(printf '%s\n' "${RESULTS[@]}" | grep -c '^FAIL' || true)
