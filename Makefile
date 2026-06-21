@@ -1,6 +1,6 @@
 ROLE := e2e
 .PHONY: test test-standalone-layout test-e2e-gate smoke smoke-presence
-test: test-standalone-layout test-e2e-gate
+test: test-standalone-layout test-e2e-gate smoke-presence
 test-standalone-layout:
 	./test/scripts/assert-layout.sh
 test-e2e-gate:

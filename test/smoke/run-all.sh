@@ -8,6 +8,14 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
+# Preflight: the suite needs a NATS broker + Go + Python (nats-py). Skip cleanly (exit 0) when
+# any prerequisite is missing, so this can be wired into `make test` without breaking minimal or
+# CI environments that have no broker.
+for tool in nats-server go python3; do
+  command -v "$tool" >/dev/null 2>&1 || { echo "SKIP observer presence smoke suite: '$tool' not available"; exit 0; }
+done
+python3 -c 'import nats' >/dev/null 2>&1 || { echo "SKIP observer presence smoke suite: python 'nats-py' not installed"; exit 0; }
+
 declare -a RESULTS
 run() { # label, command...
   local label="$1"; shift
