@@ -1,0 +1,7 @@
+# Minimal mode-relay config for the observer presence smoke test. Only dispatch_url +
+# slot_manager_url need to be present to boot (never called); listen is distinct from the
+# harness ports (14222/15555/18016) and the other fixtures.
+mode: flat
+listen: ":18023"
+dispatch_url: "http://127.0.0.1:1"
+slot_manager_url: "http://127.0.0.1:1"
