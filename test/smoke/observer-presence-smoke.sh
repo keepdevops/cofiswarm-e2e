@@ -1,13 +1,24 @@
 #!/usr/bin/env bash
 # End-to-end observer presence smoke test.
 #
-# Wires the full pipeline and drives a real Python ServiceComponent through it:
+# Boots the full pipeline and drives a component through it:
 #
-#   announce_py.py --NATS--> nats-server --swarm.>--> cofiswarm-zmq-bridge --SSE /v1/stream-->
+#   component --NATS--> nats-server --swarm.>--> cofiswarm-zmq-bridge --SSE /v1/stream-->
 #       cofiswarm-observer (announce->presence translator + roster) --/v1/observed--> assert
 #
 # Asserts the component shows ONLINE after announce, then OFFLINE after goodbye. Exercises the
-# Python attach path (cofiswarm-observer-sdk) AND the Go observer's announce/goodbye translator.
+# Go observer's announce/goodbye translator AND the chosen component's attach path.
+#
+# Usage:
+#   observer-presence-smoke.sh
+#       Default: drive a Python ServiceComponent (announce_py.py), assert component "smoke-py".
+#
+#   observer-presence-smoke.sh --go <repo> <cmd-pkg> <component_id> [-- <run arg> ...]
+#       Build <repo>/<cmd-pkg> (a Go main package), run the binary with COFISWARM_NATS_URL
+#       exported plus any run args (config paths must be ABSOLUTE), and assert <component_id>.
+#       Works for any Go service with the alongside-HTTP servicecomponent (adapters, mode relays)
+#       or -bus mode (inference engines), as long as run args make it connect + announce.
+#       See mode-relay-smoke.sh for a ready-to-run mode-cascade example.
 #
 # Requires: nats-server, go, python3 with nats-py + the observer-sdk python client importable.
 # Uses non-standard ports (14222/15555/18016) to avoid clashing with running services.
@@ -21,7 +32,6 @@ OBS_PORT=18016
 NATS_URL="nats://127.0.0.1:${NATS_PORT}"
 BRIDGE_URL="http://127.0.0.1:${BRIDGE_PORT}"
 OBS_URL="http://127.0.0.1:${OBS_PORT}"
-COMPONENT="smoke-py"
 TMP="$(mktemp -d)"
 PIDS=()
 
@@ -59,18 +69,29 @@ assert_within() { # description, expect(0=online present /1=absent), timeout_s, 
   done
 }
 
-# 1) NATS broker
+# ---- driver selection ----
+DRIVER=python
+COMPONENT="smoke-py"
+GO_REPO="" GO_CMD=""
+RUN_ARGS=()
+if [ "${1:-}" = "--go" ]; then
+  DRIVER=go; shift
+  GO_REPO="${1:?--go needs <repo>}"; GO_CMD="${2:?--go needs <cmd-pkg>}"; COMPONENT="${3:?--go needs <component_id>}"
+  shift 3
+  [ "${1:-}" = "--" ] && shift
+  RUN_ARGS=("$@")
+fi
+
+# ---- boot infra: nats + bridge + observer (fast hello/TTL so the test converges quickly) ----
 command -v nats-server >/dev/null || fail "nats-server not installed"
 nats-server -p "$NATS_PORT" >"$TMP/nats.log" 2>&1 & PIDS+=($!)
 
-# 2) zmq-bridge (NATS backend, stream wildcard swarm.>)
 log "building bridge + observer..."
 ( cd "$REPOS/cofiswarm-zmq-bridge" && go build -o "$TMP/bridge" ./cmd/cofiswarm-zmq-bridge ) || fail "bridge build"
 COFISWARM_BUS=nats COFISWARM_NATS_URL="$NATS_URL" COFISWARM_BUS_WILDCARD='swarm.>' \
   "$TMP/bridge" -listen ":$BRIDGE_PORT" -topics "$REPOS/cofiswarm-zmq-bridge/spec/topics.yaml" \
   >"$TMP/bridge.log" 2>&1 & PIDS+=($!)
 
-# 3) observer (tail the bridge SSE; fast hello/TTL so the test converges quickly)
 ( cd "$REPOS/cofiswarm-observer" && go build -o "$TMP/observer" ./cmd/cofiswarm-observer ) || fail "observer build"
 COFISWARM_BRIDGE_URL="$BRIDGE_URL" COFISWARM_HELLO_INTERVAL=2s COFISWARM_PRESENCE_TTL=10s \
   "$TMP/observer" -listen ":$OBS_PORT" >"$TMP/observer.log" 2>&1 & PIDS+=($!)
@@ -78,17 +99,28 @@ COFISWARM_BRIDGE_URL="$BRIDGE_URL" COFISWARM_HELLO_INTERVAL=2s COFISWARM_PRESENC
 wait_http "$BRIDGE_URL/healthz" "bridge" 15
 wait_http "$OBS_URL/healthz" "observer" 15
 
-# 4) Python ServiceComponent announces presence
-command -v python3 >/dev/null || fail "python3 not installed"
-PYTHONPATH="$REPOS/cofiswarm-observer-sdk/python" COFISWARM_NATS_URL="$NATS_URL" SMOKE_COMPONENT="$COMPONENT" \
-  python3 "$HERE/announce_py.py" >"$TMP/py.log" 2>&1 & PY_PID=$!; PIDS+=($PY_PID)
+# ---- start the component driver ----
+if [ "$DRIVER" = python ]; then
+  command -v python3 >/dev/null || fail "python3 not installed"
+  log "driver: python ServiceComponent ($COMPONENT)"
+  PYTHONPATH="$REPOS/cofiswarm-observer-sdk/python" COFISWARM_NATS_URL="$NATS_URL" SMOKE_COMPONENT="$COMPONENT" \
+    python3 "$HERE/announce_py.py" >"$TMP/comp.log" 2>&1 & COMP_PID=$!; PIDS+=($COMP_PID)
+else
+  log "driver: go binary $GO_REPO/$GO_CMD ($COMPONENT)"
+  ( cd "$REPOS/$GO_REPO" && go build -o "$TMP/comp" "./$GO_CMD" ) || fail "$GO_REPO build"
+  # Run the built binary from a neutral cwd; pass config via run args with an ABSOLUTE path.
+  if [ ${#RUN_ARGS[@]} -gt 0 ]; then
+    COFISWARM_NATS_URL="$NATS_URL" "$TMP/comp" "${RUN_ARGS[@]}" >"$TMP/comp.log" 2>&1 & COMP_PID=$!; PIDS+=($COMP_PID)
+  else
+    COFISWARM_NATS_URL="$NATS_URL" "$TMP/comp" >"$TMP/comp.log" 2>&1 & COMP_PID=$!; PIDS+=($COMP_PID)
+  fi
+fi
 
-# 5) assert ONLINE (allow a hello cycle in case the first announce raced the SSE subscribe)
+# ---- assert online -> goodbye -> offline ----
+# Allow a hello cycle in case the first announce raced the observer's SSE subscribe.
 assert_within "$COMPONENT appears ONLINE in /v1/observed" 0 20 "$COMPONENT"
-
-# 6) goodbye -> assert OFFLINE
 log "sending goodbye ($COMPONENT)..."
-kill "$PY_PID" 2>/dev/null
+kill "$COMP_PID" 2>/dev/null
 assert_within "$COMPONENT removed (OFFLINE) after goodbye" 1 15 "$COMPONENT"
 
-log "PASSED — full Python attach path + announce/goodbye translator verified."
+log "PASSED ($DRIVER driver) — announce + goodbye verified through the live bus."
