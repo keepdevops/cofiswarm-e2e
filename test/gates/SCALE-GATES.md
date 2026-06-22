@@ -204,12 +204,22 @@ Update this doc when `cofiswarm-slot-manager` lands.
 
 ---
 
-## 8. CI hook (future `cofiswarm-e2e`)
+## 8. CI hook — implemented (`make scale-gate`)
+
+The gate probes live in `test/gates/scripts/` and run via `make scale-gate`:
 
 ```bash
-# Pseudocode — integrate into cofiswarm-e2e
-./tests/kv_pressure_gate.sh --max-usage 0.60 --probes 5 --interval 10
-./tests/mode_smoke.sh --modes flat,pipeline,cascade,router --prompt P1
+# KV pressure gate (§3.1): PASS <0.60, WARN [0.60,0.75), FAIL >=0.75 x fail-streak.
+# Defaults to the coordinator; point at slot-manager (§7) via COFISWARM_PRESSURE_URL.
+./test/gates/scripts/kv_pressure_gate.sh --max-usage 0.60 --probes 5 --interval 10
+COFISWARM_PRESSURE_URL=http://127.0.0.1:8013/api/pressure ./test/gates/scripts/kv_pressure_gate.sh
+
+# Mode smoke (§2.2): set each mode active and stream a prompt; assert non-empty final.
+./test/gates/scripts/mode_smoke.sh --modes flat,pipeline,cascade,router --prompt "What is a binary search tree?"
 ```
 
-SCALE sprint **human sign-off** stays required until e2e covers full nominal workload.
+Both **skip cleanly (exit 0)** when their endpoint is unreachable or `curl`/`jq` are
+missing, so they wire into CI without a live inference stack breaking the build. Exit
+codes: KV gate `0`=PASS, `2`=WARN, `1`=FAIL; mode smoke `0`=all pass, `1`=any fail.
+
+SCALE sprint **human sign-off** stays required until these cover the full nominal workload.
