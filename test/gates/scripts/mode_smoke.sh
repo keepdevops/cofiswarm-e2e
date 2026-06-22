@@ -56,14 +56,21 @@ for m in "${LIST[@]}"; do
   # Stream the prompt; capture SSE. -N disables buffering; -m bounds a hung stream.
   out="$(curl -sN -m "$TIMEOUT" -X POST "$URL/api/architect/stream" \
     -H 'content-type: application/json' -d "{\"prompt\":$(jq -Rn --arg p "$PROMPT" '$p')}" 2>/dev/null)"
-  # A healthy run emits SSE data lines carrying tokens/answer; count non-comment data payloads.
+  # A healthy run emits SSE data lines carrying real tokens. Exclude framing (done) AND
+  # agent-failure tokens — the coordinator emits "Agent X (Port N) is not responding." /
+  # timeout / error deltas per dead agent, which are data lines but NOT real output. Counting
+  # them as content would false-PASS a stack whose model servers are all down.
+  # Real output = token data lines carrying a "delta", minus agent-failure deltas. (agent_done
+  # frames are {"agent":"X"} with no delta, so requiring "delta" also drops those.)
   data_lines="$(printf '%s\n' "$out" | grep -c '^data:' || true)"
-  has_content="$(printf '%s\n' "$out" | grep -E '^data:' | grep -viE 'error|^data: *\[?done\]?$' | grep -c . || true)"
+  has_content="$(printf '%s\n' "$out" | grep -E '^data:.*"delta"' \
+    | grep -viE 'error|not responding|timed out|deadline' \
+    | grep -c . || true)"
   if [ "$data_lines" -gt 0 ] && [ "$has_content" -gt 0 ]; then
-    printf '  PASS  %-10s %s data event(s)\n' "$m" "$data_lines"
+    printf '  PASS  %-10s %s real token event(s) of %s data line(s)\n' "$m" "$has_content" "$data_lines"
   else
-    printf '  FAIL  %-10s no non-empty stream output (data lines=%s)\n' "$m" "$data_lines"
-    printf '%s\n' "$out" | tail -2 | sed 's/^/      | /'
+    printf '  FAIL  %-10s no real tokens (data lines=%s, all framing/agent-down?)\n' "$m" "$data_lines"
+    printf '%s\n' "$out" | grep '^data:' | tail -2 | sed 's/^/      | /'
     fails=$((fails + 1))
   fi
 done
