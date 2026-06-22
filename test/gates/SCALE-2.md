@@ -43,14 +43,29 @@ timing out** — `endpoint not-ok = 0` means the servers stayed up the whole run
 is refusing/resetting connections** under ~72 concurrent requests against 9 slots: the HTTP
 accept layer / slot queue saturates and drops excess connections.
 
-**Ruled out:** client connect timeout (tested), per-agent read timeout (already 510 s),
-"deadline" (no such env in this build). KV pressure is a non-factor (~0.16).
+**Second test — llama-server `--threads-http`:** relaunched both llama-servers with
+`--threads-http 128` (default is -1 ≈ cores−1 ≈ 13, far below ~72 concurrent streams) and
+retried 8×: **also 3/8** — no improvement. So the HTTP accept-thread count isn't the limiter
+either.
 
-**Remaining levers** (both need a proxy rebuild + reconfigure):
-- `--parallel` (more slots) in `proxy_configure_spawn_args.h` — but the `:8082` group is a
-  14B model and free RAM is ~12 GB, so more slots risk **OOM**.
-- llama-server `--threads-http` (more HTTP accept threads to absorb connection bursts without
-  more KV) — memory-safe, but **untested** and not currently passed by the proxy spawn.
+| change | sessions with real output |
+|--------|---------------------------|
+| baseline (connect 5 s, threads-http auto) | 4 / 8 |
+| connect timeout 30 s | 3 / 8 |
+| `--threads-http 128` | 3 / 8 |
+
+**Ruled out (all tested):** client connect timeout, HTTP accept threads, per-agent read
+timeout (510 s), "deadline" (no env), KV pressure (~0.16).
+
+**Localization:** all 8 sessions *are* served by the coordinator (each gets a stream); the
+excess concurrent **per-agent streams fail at TCP connect** to llama-server (`cli.Post`→`!res`)
+beyond ~3–4 sessions' worth. This is a **connection-level limit on the llama-server side**
+(listen backlog / internal task-queue rejection) that neither the client timeout nor the HTTP
+thread count moves. Pinpointing it needs llama-server-side investigation (socket backlog,
+request-queue behavior, `ulimit -n`), not coordinator black-box tuning.
+
+**Remaining lever:** `--parallel` (more actual slots) — but OOM-bound on the 14B `:8082`
+group at ~12 GB free. Otherwise the practical answer is **cap concurrency at ~4**.
 
 ## Gate verdict
 
@@ -67,17 +82,20 @@ Runtime-only (no rebuild):
 
 Tested and **did not help** (kept for the record):
 
-2. ~~Raise the connection timeout~~ — made `set_connection_timeout` env-driven
-   (`MATRIX_AGENT_CONNECT_TIMEOUT_SECS`), rebuilt/redeployed the coordinator, retried at 30 s:
-   no change (3–4/8). The failure is connection *refusal* under load, not a timeout.
+2. ~~Raise the connection timeout~~ — `set_connection_timeout` made env-driven
+   (`MATRIX_AGENT_CONNECT_TIMEOUT_SECS`), coordinator rebuilt/redeployed, retried at 30 s:
+   no change (3–4/8). The failure is connection *refusal*, not a timeout.
+3. ~~llama-server `--threads-http`~~ — relaunched both servers with `--threads-http 128`
+   (default ≈ 13), retried 8×: no change (3/8). HTTP accept-thread count isn't the limiter.
 
-Untested, need a proxy rebuild + reconfigure (and the build is now reproducible — see below):
+Remaining / next:
 
-3. **llama-server `--threads-http`** — more HTTP accept threads to absorb connection bursts
-   without more KV (memory-safe). Add to `build_llama_args` in `proxy_configure_spawn_args.h`.
-   **Best next experiment** — it targets the actual failure (connection acceptance) at no RAM cost.
-4. **Raise `--parallel`** (more slots) — also in `proxy_configure_spawn_args.h`; trades per-slot
-   KV for concurrency, but the 14B `:8082` group + ~12 GB free risks **OOM**.
+4. **Raise `--parallel`** (more real slots) in `proxy_configure_spawn_args.h` — the only lever
+   left, but OOM-bound on the 14B `:8082` group at ~12 GB free.
+5. **llama-server-side investigation** — socket listen backlog, internal request-queue
+   rejection, `ulimit -n`. The `!res` is TCP-level, below the coordinator; needs profiling
+   the llama-server, not more coordinator/proxy knobs.
+6. **Pragmatic:** cap concurrency at ~4 (the proven clean ceiling).
 
 ### Build is reproducible
 
