@@ -21,12 +21,24 @@
 
 Per-session: 6 / 0 / 97 / 0 / 54 / 0 / 0 / 212 real tokens (four sessions got **zero**).
 
-## Why
+## Why (root cause — traced in source)
 
-8 sessions × broadcast to the 9-agent `:8082` group = ~72 simultaneous agent requests
-against **9 continuous-batching slots**. Requests that can't get a slot within the per-agent
-deadline (`MATRIX_CASCADE_AGENT_DEADLINE_SECS`) return "Agent … is not responding". So the
-ceiling is **slot concurrency**, hit long before KV pressure.
+8 sessions × broadcast to the 9-agent `:8082` group (a **Qwen2.5-14B** server) = ~72
+simultaneous connections against **9 continuous-batching slots**. Tracing the
+"not responding" string to its source (`agent_stream_llama.h` → `cli.Post` returns `!res`):
+
+- The failure is at **connect**, not read. The coordinator's per-agent HTTP client sets a
+  **hardcoded 5 s connection timeout** (`agent_stream_pool.cpp`: `set_connection_timeout(5)`).
+  When the 14B server is saturated, new connections aren't accepted within 5 s → `!res` →
+  "Agent … is not responding".
+- It is **not** a deadline: there is no `MATRIX_CASCADE_AGENT_DEADLINE_SECS` in this build
+  (stale doc reference). The per-agent `read_timeout_secs` is already **510 s** (config) and
+  governs reads *after* connect, so raising it does not help.
+- `--parallel` is fixed at the group's agent count (9) — compile-time, no override.
+
+So the ceiling is **connection acceptance under slot saturation**, hit far below KV pressure.
+Both levers that would raise it (the 5 s connection timeout; more `--parallel` slots) are
+**compile-time constants** in the proxy/coordinator — no runtime/env knob exists.
 
 ## Gate verdict
 
@@ -37,13 +49,21 @@ ceiling is **slot concurrency**, hit long before KV pressure.
 
 ## Tuning playbook (to push past the ceiling)
 
-Apply, then re-run `make scale-gate` + this load:
+Runtime-only (no rebuild):
 
-1. **Cap concurrent sessions to ~4** for clean operation at the current slot count.
-2. **Raise `--parallel`** (more slots) on the `:8082` group — trades per-slot KV
-   (`ctx_cap ÷ parallel`) for concurrency; KV has huge headroom (0.16) to spend.
-3. **Raise the per-agent deadline** so queued requests wait for a slot instead of failing.
-4. Re-measure: target all sessions returning output before advancing to SCALE-3.
+1. **Cap concurrent sessions to ~4** — the proven clean ceiling at the current build.
+
+Require a proxy/coordinator rebuild (both are compile-time constants; attempted and
+deferred — the proxy build mechanism is not discoverable in the workspace, and only ~12 GB
+is free vs a 14B model, so doubling slots risks OOM):
+
+2. **Raise the connection timeout** `set_connection_timeout(5)` in `agent_stream_pool.cpp`
+   (and/or make it env-driven) so connects to a busy server wait instead of failing in 5 s.
+3. **Raise `--parallel`** in `proxy_configure_spawn_args.h` (currently `g.names.size()`) for
+   more slots — trades per-slot KV for concurrency; KV has headroom (~0.16), but the 14B
+   group's extra KV must fit in RAM.
+
+Then re-run `make scale-gate` + this load; target all sessions returning output.
 
 ## Notes
 
